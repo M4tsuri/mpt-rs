@@ -4,12 +4,12 @@
 use std::{marker::PhantomData, mem};
 
 use serde::{Serialize, Deserialize};
+use serlp::rlp::to_bytes;
 
 use crate::{
     error::Result, 
-    hex_prefix::{bytes_to_nibbles, common_prefix}, 
-    key::{DbKey, self}, 
-    node::{MptNode, LeafNode, Subtree, BranchNode, ExtensionNode},
+    hex_prefix::{bytes_to_nibbles, common_prefix},
+    node::{MptNode, LeafNode, Subtree, BranchNode, ExtensionNode, KecHash},
     
 };
 
@@ -17,12 +17,17 @@ use crate::{
 pub trait Database {
     fn new() -> Self;
     /// insert a value
-    fn insert(&mut self, key: &DbKey, value: Vec<u8>);
-    fn exists(&mut self, key: &DbKey) -> bool;
-    fn get(&self, key: &DbKey) -> &Vec<u8>;
+    fn insert(&mut self, key: &KecHash, value: Vec<u8>);
+    fn exists(&mut self, key: &KecHash) -> bool;
+    fn get(&self, key: &KecHash) -> &Vec<u8>;
 }
 
-pub(crate) struct Trie<Db: Database> {
+pub struct Trie<'a, Db, K, V> 
+where
+    Db: Database,
+    K: Serialize,
+    V: Serialize + Deserialize<'a>
+{
     /// When root is None, the tree is empty.
     /// As is defined in the yellow paper, this tree has no empty state. 
     /// I.e. if we need an empty tree, we need to make c(J, 0) empty.
@@ -31,7 +36,45 @@ pub(crate) struct Trie<Db: Database> {
     ///  2. Extension node cannot be empty because there is no such j != 0
     ///  3. Leaf node cannot be empty because ||J|| == 0 != 1
     root: Option<MptNode>,
-    db: Db
+    db: &'a mut Db,
+    _k: PhantomData<K>,
+    _v: PhantomData<V>
+}
+
+impl<'a, Db, K, V> Trie<'a, Db, K, V>
+where
+    Db: Database,
+    K: Serialize,
+    V: Serialize + Deserialize<'a>
+{
+    pub fn new(db: &'a mut Db) -> Self {
+        Self {
+            root: None,
+            db,
+            _k: PhantomData::default(),
+            _v: PhantomData::default()
+        }
+    }
+
+    pub fn insert(self, key: &K, value: &V) -> Result<Self> {
+        let ivalue = to_bytes(value)?;
+        let rlp_key = to_bytes(key)?;
+        let ikey = bytes_to_nibbles(&rlp_key);
+
+        let node = match self.root {
+            Some(root) => node_insert(root, self.db, &ikey, ivalue),
+            None => LeafNode {
+                    remained: ikey,
+                    value: ivalue
+                }.into()
+        };
+        Ok(Self {
+            root: Some(node),
+            db: self.db,
+            _k: PhantomData::default(),
+            _v: PhantomData::default()
+        })
+    }
 }
 
 
@@ -125,9 +168,9 @@ where
                             subtree: pack_subtree(db, node)
                         }.into()
                     }
-                },
+                }
             }
-        }, 
+        }
     }
 }
 
