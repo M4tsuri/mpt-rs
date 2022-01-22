@@ -14,19 +14,29 @@
 
 use serde::{Serialize, Deserialize, Serializer, ser::SerializeSeq};
 use serde_bytes::{ByteBuf, Bytes};
-use serlp::{rlp::{
-    from_bytes, 
-    RlpNodeValue, to_bytes
-}, de::RlpProxy};
-use array_init::array_init;
-
-use crate::{
-    hex_prefix::{
-        Nibbles,
-        FLAG_MASK
-    }, 
-    key::{DbKey, serde_dbkey}
+use serlp::{
+    rlp::{from_bytes, RlpNodeValue, to_bytes}, 
+    de::RlpProxy,
+    types::byte_array
 };
+use array_init::array_init;
+use sha3::{Keccak256, Digest};
+
+use crate::hex_prefix::{
+    Nibbles,
+    FLAG_MASK
+};
+
+
+const KEY_LEN: usize = 32;
+
+pub type KecHash = [u8; KEY_LEN];
+
+pub(crate) fn keccak256(rlp: &[u8]) -> KecHash {
+    let mut hasher = Keccak256::default();
+    hasher.update(rlp);
+    hasher.finalize().into()
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub(crate) struct LeafNode {
@@ -68,8 +78,8 @@ pub(crate) enum Subtree {
     /// this field will be encoded into 0x80 with RLP encoding
     Empty,
     Node(Box<MptNode>),
-    #[serde(with = "serde_dbkey")]
-    NodeKey(DbKey)
+    #[serde(with = "byte_array")]
+    NodeKey(KecHash)
 }
 
 impl From<RlpProxy> for Subtree {
@@ -183,9 +193,9 @@ pub(crate) enum MptNode {
 }
 
 impl MptNode {
-    pub fn encode(&self) -> (DbKey, Vec<u8>) {
+    pub fn encode(&self) -> (KecHash, Vec<u8>) {
         let encoded =to_bytes(self).unwrap();
-        (DbKey::new(&encoded), encoded)
+        (keccak256(&encoded), encoded)
     }
 
     pub fn from_rlp(rlp: &[u8]) -> Self {
@@ -233,11 +243,9 @@ impl From<BranchNode> for MptNode {
 
 #[cfg(test)]
 mod test_nodes {
-    use serlp::rlp::{to_bytes, RlpTree, from_bytes};
+    use serlp::rlp::RlpTree;
 
-    use crate::{node::Subtree, key::DbKey};
-
-    use super::{LeafNode, BranchNode, ExtensionNode, MptNode};
+    use super::{LeafNode, BranchNode, ExtensionNode, MptNode, Subtree};
 
     #[test]
     fn test_extension_node() {
@@ -262,7 +270,7 @@ mod test_nodes {
         let (hash, encoded) = node.encode();
         let expected = hex::decode("e4850001020304ddc882350684636f696e8080808080808080808080808080808476657262").unwrap();
         assert_eq!(encoded, expected);
-        assert_eq!(hash.hexstring(), "64d67c5318a714d08de6958c0e63a05522642f3f1087c6fd68a97837f203d359");
+        assert_eq!(hex::encode(hash), "64d67c5318a714d08de6958c0e63a05522642f3f1087c6fd68a97837f203d359");
 
         // RLP tree construction
         let expected_tree = RlpTree::new(&expected).unwrap();

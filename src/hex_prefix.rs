@@ -1,7 +1,5 @@
 //! This is an implementation of hex-prefix encoding
 
-use std::ptr::NonNull;
-
 /// This type represents a nibble list, in which each element represents a single nibble
 pub(crate) type Nibbles = Vec<u8>;
 /// This type represents a hex-prefix encoded nibble list, 

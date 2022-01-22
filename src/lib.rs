@@ -2,7 +2,6 @@ pub mod mpt;
 mod hex_prefix;
 pub mod error;
 mod node;
-mod key;
 
 #[cfg(test)]
 mod tests {
