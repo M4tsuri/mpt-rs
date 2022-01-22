@@ -122,10 +122,10 @@ mod hex_prefix_extension {
 #[derive(Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(from = "RlpProxy")]
 pub(crate) struct BranchNode {
-    branchs: [Subtree; 16],
+    pub branchs: [Subtree; 16],
     /// vec is empty when this node is not leaf
     #[serde(with = "serde_bytes")]
-    pub(crate) value: Vec<u8>
+    pub value: Vec<u8>
 }
 
 impl From<RlpProxy> for BranchNode {

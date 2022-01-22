@@ -1,5 +1,7 @@
 //! This is an implementation of hex-prefix encoding
 
+use std::ptr::NonNull;
+
 /// This type represents a nibble list, in which each element represents a single nibble
 pub(crate) type Nibbles = Vec<u8>;
 /// This type represents a hex-prefix encoded nibble list, 
@@ -42,6 +44,25 @@ pub fn hex_prefix_decode(src: &[u8]) -> (Nibbles, bool) {
     nibbles.extend(encoded.iter().map(|i| [(i & 0xf0) >> 4, i & 0x0f]).flatten());
 
     (nibbles, prefix[0] & FLAG_MASK != 0)
+}
+
+pub fn common_prefix<'a, 'b>(a: &'a [u8], b: &'b [u8]) -> (&'a [u8], &'a [u8], &'b [u8]) {
+    let min = a.len().min(b.len());
+
+    let split = |i| {
+        (
+            &a[..i],
+            if i < a.len() { &a[i..a.len()] } else { &[] },
+            if i < b.len() { &b[i..b.len()] } else { &[] }
+        )
+    };
+
+    for i in 0..min {
+        if a[i] != b[i] {
+            return split(i)
+        }
+    }
+    return split(min)
 }
 
 pub fn bytes_to_nibbles(src: &[u8]) -> Nibbles {

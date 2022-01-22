@@ -1,31 +1,28 @@
 //! A Merkle Patricia Tree maps a 256-bit length data structure into arbitary binary data.
 //! This is an implementation of what is described in ETH Yellow Paper.
 
-use std::{marker::PhantomData};
+use std::{marker::PhantomData, mem};
 
 use serde::{Serialize, Deserialize};
 
 use crate::{
     error::Result, 
-    hex_prefix::to_nibbles,
+    hex_prefix::{bytes_to_nibbles, common_prefix}, 
+    key::{DbKey, self}, 
+    node::{MptNode, LeafNode, Subtree, BranchNode, ExtensionNode},
     
 };
 
 
-pub trait KVMap<K, V> {
+pub trait Database {
     fn new() -> Self;
     /// insert a value
-    fn insert(&mut self, key: &K);
-    fn exists(&mut self, key: &K) -> bool;
-    fn get(&self, key: &K) -> V;
+    fn insert(&mut self, key: &DbKey, value: Vec<u8>);
+    fn exists(&mut self, key: &DbKey) -> bool;
+    fn get(&self, key: &DbKey) -> &Vec<u8>;
 }
 
-pub struct MerklePatriciaTree<'a, K, V, M> 
-where
-    V: Serialize + Deserialize<'a>,
-    M: KVMap<DbKey, RLPEncoded>
-{
-    _v: PhantomData<&'a V>,
+pub(crate) struct Trie<Db: Database> {
     /// When root is None, the tree is empty.
     /// As is defined in the yellow paper, this tree has no empty state. 
     /// I.e. if we need an empty tree, we need to make c(J, 0) empty.
@@ -33,36 +30,142 @@ where
     ///  1. Branch node cannot be empty because we only use them when nessessary
     ///  2. Extension node cannot be empty because there is no such j != 0
     ///  3. Leaf node cannot be empty because ||J|| == 0 != 1
-    root: Option<MPTNode>,
-    map: M
+    root: Option<MptNode>,
+    db: Db
 }
 
-impl<'a, V, M> MerklePatriciaTree<'a, V, M>
+
+/// insert a key-value pair into trie.
+/// Value is a owned Vec<u8> here intentionally to reduce heap allocation.
+fn node_insert<Db>(root: MptNode, db: &mut Db, ikey: &[u8], ivalue: Vec<u8>) -> MptNode
 where
-    V: Serialize + Deserialize<'a>,
-    M: KVMap<MPTKey, Vec<u8>>
+    Db: Database
 {
-    pub fn new() -> Self {
-        Self {
-            _v: PhantomData::default(),
-            root: MPTNode::Empty,
-            map: M::new()
-        }
+    match root {
+        // branch node, we choose the corresponding branch and visit it
+        MptNode::Branch(BranchNode { mut branchs, value }) => {
+            // we finally hit this branch
+            if ikey.is_empty() {
+                BranchNode {
+                    branchs,
+                    value: ivalue
+                }
+            } else {
+                // now the first one nibble is comsumpted
+                let (prefix, key) = ikey.split_at(1);
+                let idx = prefix[0] as usize;
+                let subtree = Subtree::Empty;
+                // swap out the original subtree
+                let subtree = mem::replace(&mut branchs[idx], subtree);
+                branchs[idx] = subtree_insert(subtree, db, key, ivalue);
+                BranchNode { branchs, value }
+            }.into()
+        },
+        MptNode::Leaf(LeafNode { remained, value: leaf_value }) => {
+            // match max common prefix 
+            match common_prefix(ikey, &remained) {
+                // full matched, replace the value
+                (_, [], []) => {
+                    LeafNode {
+                        remained,
+                        value: ivalue
+                    }.into()
+                },
+                // not fully matched 
+                (shared, key_remained, leaf_remained) => {
+                    let branch = BranchNode::new().into();
+                    let branch = node_insert(branch, db, key_remained, ivalue);
+                    let branch = node_insert(branch, db, leaf_remained, leaf_value);
+
+                    // has no common prefix
+                    if shared.is_empty() {
+                        branch
+                    } else {
+                        ExtensionNode {
+                            shared: shared.to_vec(),
+                            subtree: pack_subtree(db, branch)
+                        }.into()
+                    }
+                },
+            }
+        },
+        MptNode::Extension(ExtensionNode { shared, subtree }) => {
+            assert!(shared.len() > 0);
+            // match max common prefix 
+            match common_prefix(ikey, &shared) {
+                // shared fully matched, track to next node
+                (_, key_remained, []) => {
+                    ExtensionNode {
+                        shared,
+                        subtree: subtree_insert(subtree, db, key_remained, ivalue)
+                    }.into()
+                },
+                // here shared is not empty, so we build a extension first
+                // leaf_remained is not empty
+                (shared, key_remained, shared_remained) => {
+                    let mut branch = BranchNode::new();
+                    // length of shared must not less than 1
+                    let (prefix, shared_remained) = shared_remained.split_at(1);
+                    let idx = prefix[0] as usize;
+                    if shared_remained.is_empty() {
+                        branch.branch(idx, subtree);
+                    } else {
+                        branch.branch(idx, pack_subtree(db, ExtensionNode {
+                            shared: shared_remained.to_vec(),
+                            subtree
+                        }.into()));
+                    }
+                    
+                    let node = node_insert(branch.into(), db, key_remained, ivalue);
+                    if shared.is_empty() {
+                        node
+                    } else {
+                        ExtensionNode {
+                            shared: shared.to_vec(),
+                            subtree: pack_subtree(db, node)
+                        }.into()
+                    }
+                },
+            }
+        }, 
     }
+}
 
-    pub fn insert(&mut self, value: &V) -> Result<MPTKey> {
-        let key = MPTKey::new(value)?;
-        let index_key = to_nibbles(&key.0);
-        Self::insert_with_key(&mut self.root, &index_key, value);
-        Ok(key)
-
-    }
-
-    fn insert_with_key(root: &mut MPTNode, key: &[u8], value: &V) {
-        match root {
-            MPTNode::Path(_) => todo!(),
-            MPTNode::Branch(_) => todo!(),
-            MPTNode::Empty => todo!()
+fn subtree_insert<Db>(subtree: Subtree, db: &mut Db, key: &[u8], value: Vec<u8>) -> Subtree
+where 
+    Db: Database
+{
+    let node = match subtree {
+        // subtress is empty, we 
+        Subtree::Empty => {
+            LeafNode {
+                remained: key.to_vec(),
+                value: value.to_vec()
+            }.into()
+        },
+        Subtree::Node(root) => {
+            node_insert(*root, db, key, value)
+        },
+        Subtree::NodeKey(dbkey) => {
+            let rlp = db.get(&dbkey);
+            let root = MptNode::from_rlp(&rlp);
+            node_insert(root, db, key, value)
         }
+    };
+    pack_subtree(db, node)
+}
+
+/// pack a key-value pair into a subtree
+fn pack_subtree<Db>(db: &mut Db, node: MptNode) -> Subtree 
+where
+    Db: Database
+{
+    let (dbkey, rlp) = node.encode();
+
+    if rlp.len() < 32 {
+        Subtree::Node(Box::new(node))
+    } else {
+        db.insert(&dbkey, rlp);
+        Subtree::NodeKey(dbkey)
     }
 }
