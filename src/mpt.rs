@@ -5,14 +5,24 @@ use std::{marker::PhantomData, mem};
 
 use serde::{Serialize, Deserialize};
 use serlp::rlp::to_bytes;
+use sha3::{Keccak256, Digest};
 
 use crate::{
     error::Result, 
     hex_prefix::{bytes_to_nibbles, common_prefix},
-    node::{MptNode, LeafNode, Subtree, BranchNode, ExtensionNode, KecHash},
+    node::{MptNode, LeafNode, Subtree, BranchNode, ExtensionNode},
     
 };
 
+pub const KEY_LEN: usize = 32;
+
+pub type KecHash = [u8; KEY_LEN];
+
+pub(crate) fn keccak256(rlp: &[u8]) -> KecHash {
+    let mut hasher = Keccak256::default();
+    hasher.update(rlp);
+    hasher.finalize().into()
+}
 
 pub trait Database {
     fn new() -> Self;
@@ -35,8 +45,8 @@ where
     ///  1. Branch node cannot be empty because we only use them when nessessary
     ///  2. Extension node cannot be empty because there is no such j != 0
     ///  3. Leaf node cannot be empty because ||J|| == 0 != 1
-    root: Option<MptNode>,
-    db: &'a mut Db,
+    pub root_hash: Option<KecHash>,
+    pub db: &'a mut Db,
     _k: PhantomData<K>,
     _v: PhantomData<V>
 }
@@ -49,11 +59,15 @@ where
 {
     pub fn new(db: &'a mut Db) -> Self {
         Self {
-            root: None,
+            root_hash: None,
             db,
             _k: PhantomData::default(),
             _v: PhantomData::default()
         }
+    }
+
+    pub fn root_hash(&self) -> Option<KecHash> {
+        self.root_hash
     }
 
     pub fn insert(self, key: &K, value: &V) -> Result<Self> {
@@ -61,15 +75,20 @@ where
         let rlp_key = to_bytes(key)?;
         let ikey = bytes_to_nibbles(&rlp_key);
 
-        let node = match self.root {
-            Some(root) => node_insert(root, self.db, &ikey, ivalue),
+        let node = match self.root_hash {
+            Some(root_hash) => {
+                let root = MptNode::from_rlp(self.db.get(&root_hash));
+                node_insert(root, self.db, &ikey, ivalue)
+            },
             None => LeafNode {
                     remained: ikey,
                     value: ivalue
                 }.into()
         };
+        let (hash, rlp) = node.encode();
+        self.db.insert(&hash, rlp);
         Ok(Self {
-            root: Some(node),
+            root_hash: Some(hash),
             db: self.db,
             _k: PhantomData::default(),
             _v: PhantomData::default()

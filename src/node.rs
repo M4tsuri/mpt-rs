@@ -20,23 +20,11 @@ use serlp::{
     types::byte_array
 };
 use array_init::array_init;
-use sha3::{Keccak256, Digest};
 
-use crate::hex_prefix::{
+use crate::{hex_prefix::{
     Nibbles,
     FLAG_MASK
-};
-
-
-const KEY_LEN: usize = 32;
-
-pub type KecHash = [u8; KEY_LEN];
-
-pub(crate) fn keccak256(rlp: &[u8]) -> KecHash {
-    let mut hasher = Keccak256::default();
-    hasher.update(rlp);
-    hasher.finalize().into()
-}
+}, mpt::{KecHash, keccak256, KEY_LEN}};
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub(crate) struct LeafNode {
@@ -90,7 +78,12 @@ impl From<RlpProxy> for Subtree {
             // empty 
             1 if buf[0] == 0x80 => Subtree::Empty,
             1..=31 => Subtree::Node(Box::new(from_bytes(&buf).unwrap())),
-            32.. => Subtree::NodeKey(from_bytes(&buf).unwrap()),
+            32.. => {
+                let key_buf: ByteBuf = from_bytes(buf).unwrap();
+                let mut key = [0; KEY_LEN];
+                key.copy_from_slice(&key_buf);
+                Subtree::NodeKey(key)
+            },
             _ => panic!("Error subtree encoding.")
         }
     }
