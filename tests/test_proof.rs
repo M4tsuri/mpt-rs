@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use mpt_rs::mpt::{Trie, Database, KecHash};
+use mpt_rs::{mpt::{Trie, Database, KecHash}, proof::verify_prove};
 use serde::{Deserialize, Serialize};
 use num_bigint::BigUint;
 use serde_bytes;
@@ -28,7 +28,7 @@ struct LegacyTx {
 }
 
 #[test]
-fn test_proof() {
+fn test_tx() {
     let bn = |s| BigUint::from_bytes_be(&hex::decode(s).unwrap());
     let to_addr = |s| {
         let mut addr = [0; 20];
@@ -97,10 +97,10 @@ fn test_proof() {
 
 #[test]
 fn test_extension() {
-    let a = "a".to_string().repeat(40);
-    let b = "b".to_string().repeat(40);
-    let c = "c".to_string().repeat(40);
-    let d = "d".to_string().repeat(40);
+    let a = "a".to_string().repeat(1);
+    let b = "b".to_string().repeat(20);
+    let c = "c".to_string().repeat(35);
+    let d = "d".to_string().repeat(400);
 
     let mut trie: Trie<MapDb, _, _> = Trie::new();
 
@@ -110,12 +110,46 @@ fn test_extension() {
     trie = trie.insert(&"aaaa", &c);
     trie = trie.insert(&"aa", &d);
 
-    println!("Root Hash: {}", hex::encode(trie.root_hash().unwrap()));
-    println!("aaaa: {}", trie.get(&"aaaa").unwrap());
+    assert_eq!(b, trie.get(&"aaaab").unwrap());
+    assert_eq!(None, trie.get(&"a"));
+    assert_eq!(c, trie.get(&"aaaa").unwrap());
+    assert_eq!(d, trie.get(&"aa").unwrap());
 
     // revert the state
     trie = trie.revert(root_hash);
-    println!("aaaa: {}", trie.get(&"aaaa").unwrap());
+    assert_eq!(a, trie.get(&"aaaa").unwrap());
+}
+
+#[test]
+fn test_proof() {
+    let a = "a".to_string().repeat(1);
+    let b = "b".to_string().repeat(20);
+    let c = "c".to_string().repeat(35);
+    let d = "d".to_string().repeat(400);
+
+    let mut trie: Trie<MapDb, _, _> = Trie::new();
+
+    trie = trie.insert(&"aaaa", &a);
+    trie = trie.insert(&"aaaab", &b);
+    let old_root_hash = trie.root_hash().unwrap();
+    trie = trie.insert(&"aaaa", &c);
+    trie = trie.insert(&"aa", &d);
+    let new_root_hash = trie.root_hash().unwrap();
+
+    // proof of existence 
+    let (proof, exists) = trie.prove::<MapDb>(&"aaaa");
+    assert_eq!(exists, true);
+    // verify with old hash, this should fail
+    assert!(!verify_prove(&old_root_hash, &proof, &"aaaa"));
+    // verify with the newest hash, should success
+    assert!(verify_prove(&new_root_hash, &proof, &"aaaa"));
+
+    // proof of non-existence
+    let (proof, exists) = trie.prove::<MapDb>(&"a");
+    assert_eq!(exists, false);
+    // both should fail
+    assert!(!verify_prove(&old_root_hash, &proof, &"a"));
+    assert!(!verify_prove(&new_root_hash, &proof, &"a"));
 }
 
 #[derive(Debug, Clone)]
@@ -134,7 +168,7 @@ impl Database for MapDb {
         self.0.contains_key(key)
     }
 
-    fn get(&self, key: &KecHash) -> &Vec<u8> {
-        self.0.get(key).unwrap()
+    fn get(&self, key: &KecHash) -> Option<&Vec<u8>> {
+        self.0.get(key)
     }
 }
