@@ -65,7 +65,7 @@ pub fn common_prefix<'a, 'b>(a: &'a [u8], b: &'b [u8]) -> (&'a [u8], &'a [u8], &
 
 pub fn bytes_to_nibbles(src: &[u8]) -> Nibbles {
     src.iter().map(|x| {
-        [x & 0xf0 >> 4, x & 0x0f]
+        [(x & 0xf0) >> 4, x & 0x0f]
     }).flatten().collect()
 }
 
