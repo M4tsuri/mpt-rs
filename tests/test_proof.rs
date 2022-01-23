@@ -86,17 +86,39 @@ fn test_proof() {
     };
 
     let txs = [tx0, tx1, tx2, tx3];
-    let mut db = MapDb::new();
-    let mut tire = Trie::new(&mut db);
+    let mut trie: Trie<MapDb, _, _> = Trie::new();
 
     for (i, tx) in txs.iter().enumerate() {
-        tire = tire.insert(&i, tx).unwrap();
+        trie = trie.insert(&i, tx);
     }
 
-    println!("Root Hash: {}", hex::encode(tire.root_hash().unwrap()))
+    println!("Root Hash: {}", hex::encode(trie.root_hash().unwrap()))
 }
 
-#[derive(Debug)]
+#[test]
+fn test_extension() {
+    let a = "a".to_string().repeat(40);
+    let b = "b".to_string().repeat(40);
+    let c = "c".to_string().repeat(40);
+    let d = "d".to_string().repeat(40);
+
+    let mut trie: Trie<MapDb, _, _> = Trie::new();
+
+    trie = trie.insert(&"aaaa", &a);
+    trie = trie.insert(&"aaaab", &b);
+    let root_hash = trie.root_hash().unwrap();
+    trie = trie.insert(&"aaaa", &c);
+    trie = trie.insert(&"aa", &d);
+
+    println!("Root Hash: {}", hex::encode(trie.root_hash().unwrap()));
+    println!("aaaa: {}", trie.get(&"aaaa").unwrap());
+
+    // revert the state
+    trie = trie.revert(root_hash);
+    println!("aaaa: {}", trie.get(&"aaaa").unwrap());
+}
+
+#[derive(Debug, Clone)]
 struct MapDb(HashMap<KecHash, Vec<u8>>);
 
 impl Database for MapDb {

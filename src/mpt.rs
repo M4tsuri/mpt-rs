@@ -3,15 +3,13 @@
 
 use std::{marker::PhantomData, mem};
 
-use serde::{Serialize, Deserialize};
-use serlp::rlp::to_bytes;
+use serde::{Serialize, de::DeserializeOwned};
+use serlp::rlp::{to_bytes, from_bytes};
 use sha3::{Keccak256, Digest};
 
 use crate::{
-    error::Result, 
     hex_prefix::{bytes_to_nibbles, common_prefix},
     node::{MptNode, LeafNode, Subtree, BranchNode, ExtensionNode},
-    
 };
 
 pub const KEY_LEN: usize = 32;
@@ -32,11 +30,12 @@ pub trait Database {
     fn get(&self, key: &KecHash) -> &Vec<u8>;
 }
 
-pub struct Trie<'a, Db, K, V> 
+#[derive(Clone)]
+pub struct Trie<Db, K, V> 
 where
     Db: Database,
     K: Serialize,
-    V: Serialize + Deserialize<'a>
+    V: Serialize + DeserializeOwned
 {
     /// When root is None, the tree is empty.
     /// As is defined in the yellow paper, this tree has no empty state. 
@@ -46,21 +45,21 @@ where
     ///  2. Extension node cannot be empty because there is no such j != 0
     ///  3. Leaf node cannot be empty because ||J|| == 0 != 1
     pub root_hash: Option<KecHash>,
-    pub db: &'a mut Db,
+    pub db: Db,
     _k: PhantomData<K>,
     _v: PhantomData<V>
 }
 
-impl<'a, Db, K, V> Trie<'a, Db, K, V>
+impl<Db, K, V> Trie<Db, K, V>
 where
     Db: Database,
     K: Serialize,
-    V: Serialize + Deserialize<'a>
+    V: Serialize + DeserializeOwned
 {
-    pub fn new(db: &'a mut Db) -> Self {
+    pub fn new() -> Self {
         Self {
             root_hash: None,
-            db,
+            db: Db::new(),
             _k: PhantomData::default(),
             _v: PhantomData::default()
         }
@@ -70,15 +69,24 @@ where
         self.root_hash
     }
 
-    pub fn insert(self, key: &K, value: &V) -> Result<Self> {
-        let ivalue = to_bytes(value)?;
-        let rlp_key = to_bytes(key)?;
+    pub fn revert(self, root_hash: KecHash) -> Self {
+        Self {
+            root_hash: Some(root_hash),
+            db: self.db,
+            _k: PhantomData::default(),
+            _v: PhantomData::default()
+        }
+    }
+
+    pub fn insert(mut self, key: &K, value: &V) -> Self {
+        let ivalue = to_bytes(value).unwrap();
+        let rlp_key = to_bytes(key).unwrap();
         let ikey = bytes_to_nibbles(&rlp_key);
 
         let node = match self.root_hash {
             Some(root_hash) => {
                 let root = MptNode::from_rlp(self.db.get(&root_hash));
-                node_insert(root, self.db, &ikey, ivalue)
+                node_insert(root, &mut self.db, &ikey, ivalue)
             },
             None => LeafNode {
                     remained: ikey,
@@ -87,12 +95,62 @@ where
         };
         let (hash, rlp) = node.encode();
         self.db.insert(&hash, rlp);
-        Ok(Self {
+        Self {
             root_hash: Some(hash),
             db: self.db,
             _k: PhantomData::default(),
             _v: PhantomData::default()
-        })
+        }
+    }
+
+    pub fn get(&self, key: &K) -> Option<V> {
+        let rlp_key = to_bytes(key).unwrap();
+        let ikey = bytes_to_nibbles(&rlp_key);
+
+        if let Some(root_hash) = self.root_hash {
+            let root = MptNode::from_rlp(self.db.get(&root_hash));
+            if let Some(value) = node_get(&root, &self.db, &ikey) {
+                Some(from_bytes(&value).unwrap())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+}
+
+/// get value with a key from the trie
+fn node_get<Db>(root: &MptNode, db: &Db, ikey: &[u8]) -> Option<Vec<u8>>
+where
+    Db: Database
+{
+    match root {
+        MptNode::Leaf(LeafNode { remained, value: leaf_value }) => {
+            if remained != ikey {
+                None
+            } else {
+                Some(leaf_value.clone())
+            }
+        },
+        MptNode::Extension(ExtensionNode { shared, subtree }) => {
+            match common_prefix(&shared, ikey) {
+                (_, [], key_remained) => {
+                    subtree_get(subtree, db, key_remained)
+                },
+                _ => None
+            }
+        },
+        MptNode::Branch(BranchNode { branchs, value }) => {
+            if ikey.is_empty() {
+                Some(value.clone())
+            } else {
+                let (prefix, key_remained) = ikey.split_at(1);
+                let idx = prefix[0] as usize;
+                let subtree = &branchs[idx];
+                subtree_get(subtree, db, key_remained)
+            }
+        },
     }
 }
 
@@ -189,6 +247,21 @@ where
                     }
                 }
             }
+        }
+    }
+}
+
+fn subtree_get<Db>(subtree: &Subtree, db: &Db, key: &[u8]) -> Option<Vec<u8>> 
+where
+    Db: Database
+{
+    match subtree {
+        Subtree::Empty => None,
+        Subtree::Node(node) => node_get(node, db, key),
+        Subtree::NodeKey(dbkey) => {
+            let rlp = db.get(&dbkey);
+            let root = MptNode::from_rlp(&rlp);
+            node_get(&root, db, key)
         }
     }
 }
