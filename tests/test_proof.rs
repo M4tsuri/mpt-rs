@@ -91,13 +91,15 @@ fn test_tx() {
     for (i, tx) in txs.iter().enumerate() {
         trie = trie.insert(&i, tx);
     }
-
-    println!("Root Hash: {}", hex::encode(trie.commit().unwrap()));
-    // assert_eq!("0xab41f886be23cd786d8a69a72b0f988ea72e0b2e03970d0798f5e03763a442cc")
+    
+    assert_eq!(
+        "ab41f886be23cd786d8a69a72b0f988ea72e0b2e03970d0798f5e03763a442cc",
+        hex::encode(trie.commit().unwrap())
+    )
 }
 
 #[test]
-fn test_extension() {
+fn test_revert() {
     let a = "a".to_string().repeat(1);
     let b = "b".to_string().repeat(20);
     let c = "c".to_string().repeat(35);
@@ -107,7 +109,7 @@ fn test_extension() {
 
     trie = trie.insert(&"aaaa", &a);
     trie = trie.insert(&"aaaab", &b);
-    // let root_hash = trie.root_hash().unwrap();
+    let root_hash = trie.commit().unwrap();
     trie = trie.insert(&"aaaa", &c);
     trie = trie.insert(&"aa", &d);
 
@@ -117,8 +119,8 @@ fn test_extension() {
     assert_eq!(d, trie.get(&"aa").unwrap());
 
     // revert the state
-    // trie = trie.revert(root_hash);
-    // assert_eq!(a, trie.get(&"aaaa").unwrap());
+    trie = trie.revert(root_hash).unwrap();
+    assert_eq!(a, trie.get(&"aaaa").unwrap());
 }
 
 #[test]
@@ -132,25 +134,25 @@ fn test_proof() {
 
     trie = trie.insert(&"aaaa", &a);
     trie = trie.insert(&"aaaab", &b);
-    // let old_root_hash = trie.root_hash().unwrap();
+    let old_root_hash = trie.commit().unwrap();
     trie = trie.insert(&"aaaa", &c);
     trie = trie.insert(&"aa", &d);
-    // let new_root_hash = trie.root_hash().unwrap();
+    let new_root_hash = trie.commit().unwrap();
 
     // proof of existence 
     let (proof, exists) = trie.prove::<MapDb>(&"aaaa");
     assert_eq!(exists, true);
     // verify with old hash, this should fail
-    // assert!(!verify_prove(&old_root_hash, &proof, &"aaaa"));
+    assert!(!verify_prove(&old_root_hash, &proof, &"aaaa"));
     // verify with the newest hash, should success
-    // assert!(verify_prove(&new_root_hash, &proof, &"aaaa"));
+    assert!(verify_prove(&new_root_hash, &proof, &"aaaa"));
 
     // proof of non-existence
     let (proof, exists) = trie.prove::<MapDb>(&"a");
     assert_eq!(exists, false);
     // both should fail
-    // assert!(!verify_prove(&old_root_hash, &proof, &"a"));
-    // assert!(!verify_prove(&new_root_hash, &proof, &"a"));
+    assert!(!verify_prove(&old_root_hash, &proof, &"a"));
+    assert!(!verify_prove(&new_root_hash, &proof, &"a"));
 }
 
 #[derive(Debug, Clone)]
