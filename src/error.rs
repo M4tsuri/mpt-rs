@@ -3,7 +3,8 @@ use serlp;
 #[derive(Debug)]
 pub enum Error {
     EncodingError(String),
-    DatabaseError
+    DatabaseError,
+    StateNotFound
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

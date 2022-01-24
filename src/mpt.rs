@@ -9,7 +9,8 @@ use sha3::{Keccak256, Digest};
 
 use crate::{
     hex_prefix::{bytes_to_nibbles, common_prefix},
-    node::{MptNode, LeafNode, Subtree, BranchNode, ExtensionNode},
+    node::{MptNode, LeafNode, Subtree, BranchNode, ExtensionNode}, error::Error,
+    error::Result
 };
 
 pub const KEY_LEN: usize = 32;
@@ -44,8 +45,10 @@ where
     ///  1. Branch node cannot be empty because we only use them when nessessary
     ///  2. Extension node cannot be empty because there is no such j != 0
     ///  3. Leaf node cannot be empty because ||J|| == 0 != 1
-    pub root_hash: Option<KecHash>,
+    root: Option<MptNode>,
     pub db: Db,
+    dirty: bool,
+    root_hash: Option<KecHash>,
     _k: PhantomData<K>,
     _v: PhantomData<V>
 }
@@ -58,23 +61,27 @@ where
 {
     pub fn new() -> Self {
         Self {
-            root_hash: None,
+            root: None,
             db: Db::new(),
+            dirty: false,
+            root_hash: None,
             _k: PhantomData::default(),
             _v: PhantomData::default()
         }
     }
 
-    pub fn root_hash(&self) -> Option<KecHash> {
-        self.root_hash
-    }
-
-    pub fn revert(self, root_hash: KecHash) -> Self {
-        Self {
-            root_hash: Some(root_hash),
-            db: self.db,
-            _k: PhantomData::default(),
-            _v: PhantomData::default()
+    pub fn revert(self, root_hash: KecHash) -> Result<Self> {
+        if let Some(rlp) = self.db.get(&root_hash) {
+            Ok(Self {
+                root: Some(MptNode::from_rlp(&rlp)),
+                dirty: false,
+                root_hash: Some(root_hash),
+                db: self.db,
+                _k: self._k,
+                _v: self._v
+            })
+        } else {
+            Err(Error::StateNotFound)
         }
     }
 
@@ -83,21 +90,19 @@ where
         let rlp_key = to_bytes(key).unwrap();
         let ikey = bytes_to_nibbles(&rlp_key);
 
-        let node = match self.root_hash {
-            Some(root_hash) => {
-                let root = MptNode::from_rlp(self.db.get(&root_hash).unwrap());
-                node_insert(root, &mut self.db, &ikey, ivalue)
-            },
+        let node = match self.root {
+            Some(root) => node_insert(root, &mut self.db, &ikey, ivalue),
             None => LeafNode {
                     remained: ikey,
                     value: ivalue
                 }.into()
         };
-        let (hash, rlp) = node.encode();
-        self.db.insert(&hash, rlp);
+
         Self {
-            root_hash: Some(hash),
+            root: Some(node),
             db: self.db,
+            dirty: true,
+            root_hash: self.root_hash,
             _k: PhantomData::default(),
             _v: PhantomData::default()
         }
@@ -107,9 +112,8 @@ where
         let rlp_key = to_bytes(key).unwrap();
         let ikey = bytes_to_nibbles(&rlp_key);
 
-        if let Some(root_hash) = self.root_hash {
-            let root = MptNode::from_rlp(self.db.get(&root_hash).unwrap());
-            if let Some(value) = node_get(&root, &self.db, &ikey) {
+        if let Some(root) = &self.root {
+            if let Some(value) = node_get(root, &self.db, &ikey) {
                 Some(from_bytes(&value).unwrap())
             } else {
                 None
@@ -119,20 +123,89 @@ where
         }
     }
 
-    pub fn prove<ProofDb: Database>(&self, key: &K) -> (ProofDb, bool) {
+    pub fn commit(&mut self) -> Option<KecHash> {
+        if !self.dirty {
+            return self.root_hash
+        }
+
+        if let Some(root) = &mut self.root {
+            let dbkey = node_collapse(root, &mut self.db);
+            match dbkey {
+                Some(key) => self.root_hash = Some(key),
+                None => {
+                    let (dbkey, rlp) = root.encode();
+                    self.db.insert(&dbkey, rlp);
+                    self.root_hash = Some(dbkey);
+                },
+            }
+        } else {
+            self.root_hash = None;
+        };
+        self.dirty = false;
+        self.root_hash
+    }
+
+    pub fn prove<ProofDb: Database>(&mut self, key: &K) -> (ProofDb, bool) {
+        if self.dirty {
+            self.commit();
+        }
+
         let mut proof = ProofDb::new();
 
         let rlp_key = to_bytes(key).unwrap();
         let ikey = bytes_to_nibbles(&rlp_key);
 
-        let exists = if let Some(root_hash) = self.root_hash {
-            let root = MptNode::from_rlp(self.db.get(&root_hash).unwrap());
-            node_prove(&root, &self.db, &mut proof, &ikey)
+        let exists = if let Some(root) = &self.root {
+            
+            node_prove(root, &self.db, &mut proof, &ikey)
         } else {
             false
         };
 
         (proof, exists)
+    }
+}
+
+/// collapse a node
+/// returns (collapsed node, collapsed node length)
+fn node_collapse<Db>(root: &mut MptNode, db: &mut Db) -> Option<KecHash>
+where
+    Db: Database
+{
+    let rlp = to_bytes(&root).unwrap();
+
+    // this node do not need to be collapsed
+    if rlp.len() < 32 {
+        return None;
+    }
+
+    match root {
+        MptNode::Leaf(_) => {},
+        MptNode::Branch(b) => {
+            for branch in &mut b.branchs {
+                subtree_collapse(branch, db);
+            }
+        },
+        MptNode::Extension(ext) => {
+            subtree_collapse(&mut ext.subtree, db)
+        }
+    };
+
+    let (dbkey, rlp) = root.encode();
+    // after collapsing, a node either keeps unchanged, or part of it is committed to database,
+    // in the later case, the node must contains a database key, whose length is 32
+    // so the rlp length of collapsed node must exceeds the 32 byte limit
+    assert!(rlp.len() >= 32);
+    db.insert(&dbkey, rlp);
+    Some(dbkey)
+}
+
+fn subtree_collapse<Db>(subtree: &mut Subtree, db: &mut Db)
+where 
+    Db: Database
+{
+    if let Subtree::Node(root) = subtree {
+        node_collapse(root, db);
     }
 }
 
@@ -277,7 +350,7 @@ where
                     } else {
                         ExtensionNode {
                             shared: shared.to_vec(),
-                            subtree: pack_subtree(db, branch)
+                            subtree: MptNode::from(branch).into()
                         }.into()
                     }
                 },
@@ -304,10 +377,10 @@ where
                     if shared_remained.is_empty() {
                         branch.branch(idx, subtree);
                     } else {
-                        branch.branch(idx, pack_subtree(db, ExtensionNode {
+                        branch.branch(idx, MptNode::from(ExtensionNode {
                             shared: shared_remained.to_vec(),
                             subtree
-                        }.into()));
+                        }).into());
                     }
                     
                     let node = node_insert(branch.into(), db, key_remained, ivalue);
@@ -316,7 +389,7 @@ where
                     } else {
                         ExtensionNode {
                             shared: shared.to_vec(),
-                            subtree: pack_subtree(db, node)
+                            subtree: MptNode::from(node).into()
                         }.into()
                     }
                 }
@@ -329,7 +402,7 @@ fn subtree_insert<Db>(subtree: Subtree, db: &mut Db, key: &[u8], value: Vec<u8>)
 where 
     Db: Database
 {
-    let node = match subtree {
+    Subtree::Node(Box::new(match subtree {
         // subtress is empty, we 
         Subtree::Empty => {
             LeafNode {
@@ -345,21 +418,5 @@ where
             let root = MptNode::from_rlp(&rlp);
             node_insert(root, db, key, value)
         }
-    };
-    pack_subtree(db, node)
-}
-
-/// pack a key-value pair into a subtree
-fn pack_subtree<Db>(db: &mut Db, node: MptNode) -> Subtree 
-where
-    Db: Database
-{
-    let (dbkey, rlp) = node.encode();
-
-    if rlp.len() < 32 {
-        Subtree::Node(Box::new(node))
-    } else {
-        db.insert(&dbkey, rlp);
-        Subtree::NodeKey(dbkey)
-    }
+    }))
 }

@@ -70,6 +70,12 @@ pub(crate) enum Subtree {
     NodeKey(KecHash)
 }
 
+impl From<MptNode> for Subtree {
+    fn from(node: MptNode) -> Self {
+        Self::Node(Box::new(node))
+    }
+}
+
 impl From<RlpProxy> for Subtree {
     fn from(node: RlpProxy) -> Self {
         let buf = node.raw();
