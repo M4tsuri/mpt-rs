@@ -123,31 +123,33 @@ where
         }
     }
 
-    pub fn commit(&mut self) -> Option<KecHash> {
-        if !self.dirty {
-            return self.root_hash
-        }
-
-        if let Some(root) = &mut self.root {
-            let dbkey = node_collapse(root, &mut self.db);
-            match dbkey {
-                Some(key) => self.root_hash = Some(key),
-                None => {
-                    let (dbkey, rlp) = root.encode();
-                    self.db.insert(&dbkey, rlp);
-                    self.root_hash = Some(dbkey);
-                },
+    pub fn commit(mut self) -> Self {
+        let (root, root_hash) = if let Some(root) = self.root {
+            match node_collapse(root, &mut self.db) {
+                Subtree::Empty => todo!(),
+                Subtree::Node(_) => todo!(),
+                Subtree::NodeKey(_) => todo!(),
             }
         } else {
-            self.root_hash = None;
+            (self.root, None)
         };
-        self.dirty = false;
-        self.root_hash
+
+        Self {
+            root,
+            db: self.db,
+            dirty: false,
+            root_hash,
+            _k: PhantomData::default(),
+            _v: PhantomData::default()
+        }
     }
 
     pub fn prove<ProofDb: Database>(&mut self, key: &K) -> (ProofDb, bool) {
         if self.dirty {
-            self.commit();
+            let mut tmp = Self::new();
+            tmp = mem::replace(self, tmp);
+            tmp = tmp.commit();
+            *self = tmp;
         }
 
         let mut proof = ProofDb::new();
@@ -168,7 +170,7 @@ where
 
 /// collapse a node
 /// returns (collapsed node, collapsed node length)
-fn node_collapse<Db>(root: &mut MptNode, db: &mut Db) -> Option<KecHash>
+fn node_collapse<Db>(root: &MptNode, db: &mut Db) -> Subtree
 where
     Db: Database
 {
@@ -176,36 +178,43 @@ where
 
     // this node do not need to be collapsed
     if rlp.len() < 32 {
-        return None;
+        return Subtree::Node(Box::new(root.clone()))
     }
 
-    match root {
-        MptNode::Leaf(_) => {},
-        MptNode::Branch(b) => {
-            for branch in &mut b.branchs {
-                subtree_collapse(branch, db);
+    let node_collapsed = match root {
+        MptNode::Leaf(_) => root.clone(),
+        MptNode::Branch(BranchNode { branchs, value }) => {
+            let mut collapsed_node = BranchNode::new();
+            for (idx, branch) in branchs.iter().enumerate() {
+                collapsed_node.branch(idx, subtree_collapse(branch, db));
             }
+            collapsed_node.value = value.clone();
+            collapsed_node.into()
         },
-        MptNode::Extension(ext) => {
-            subtree_collapse(&mut ext.subtree, db)
+        MptNode::Extension(ExtensionNode { shared, subtree }) => {
+            ExtensionNode {
+                shared: shared.clone(),
+                subtree: subtree_collapse(subtree, db)
+            }.into()
         }
     };
 
-    let (dbkey, rlp) = root.encode();
+    let (dbkey, rlp) = node_collapsed.encode();
     // after collapsing, a node either keeps unchanged, or part of it is committed to database,
     // in the later case, the node must contains a database key, whose length is 32
     // so the rlp length of collapsed node must exceeds the 32 byte limit
     assert!(rlp.len() >= 32);
     db.insert(&dbkey, rlp);
-    Some(dbkey)
+    Subtree::NodeKey(dbkey)
 }
 
-fn subtree_collapse<Db>(subtree: &mut Subtree, db: &mut Db)
+fn subtree_collapse<Db>(subtree: &Subtree, db: &mut Db) -> Subtree
 where 
     Db: Database
 {
-    if let Subtree::Node(root) = subtree {
-        node_collapse(root, db);
+    match subtree {
+        Subtree::Node(root) => node_collapse(root, db),
+        _ => subtree.clone()
     }
 }
 
