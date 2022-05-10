@@ -28,7 +28,7 @@ pub trait Database {
     /// insert a value
     fn insert(&mut self, key: &KecHash, value: Vec<u8>);
     fn exists(&mut self, key: &KecHash) -> bool;
-    fn get(&self, key: &KecHash) -> Option<&Vec<u8>>;
+    fn get(&self, key: &KecHash) -> Option<&[u8]>;
 }
 
 #[derive(Clone)]

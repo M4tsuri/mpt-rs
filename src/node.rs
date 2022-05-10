@@ -193,7 +193,7 @@ pub(crate) enum MptNode {
 
 impl MptNode {
     pub fn encode(&self) -> (KecHash, Vec<u8>) {
-        let encoded =to_bytes(self).unwrap();
+        let encoded = to_bytes(self).unwrap();
         (keccak256(&encoded), encoded)
     }
 
