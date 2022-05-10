@@ -28,7 +28,7 @@ pub trait Database {
     /// insert a value
     fn insert(&mut self, key: &KecHash, value: Vec<u8>);
     fn exists(&mut self, key: &KecHash) -> bool;
-    fn get(&self, key: &KecHash) -> Option<&[u8]>;
+    fn get(&self, key: &KecHash) -> Option<Vec<u8>>;
 }
 
 #[derive(Clone)]
@@ -133,7 +133,7 @@ where
                     Some(*node)
                 },
                 Subtree::NodeKey(dbkey) => {
-                    let node = MptNode::from_rlp(self.db.get(&dbkey).unwrap());
+                    let node = MptNode::from_rlp(&self.db.get(&dbkey).unwrap());
                     self.root_hash = Some(dbkey);
                     Some(node)
                 },

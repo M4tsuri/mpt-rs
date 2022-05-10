@@ -171,7 +171,7 @@ impl Database for MapDb {
         self.0.contains_key(key)
     }
 
-    fn get(&self, key: &KecHash) -> Option<&[u8]> {
-        self.0.get(key).map(|v| v.as_slice())
+    fn get(&self, key: &KecHash) -> Option<Vec<u8>> {
+        self.0.get(key).cloned()
     }
 }
