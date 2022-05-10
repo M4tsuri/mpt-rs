@@ -10,7 +10,7 @@ use sha3::{Keccak256, Digest};
 use crate::{
     hex_prefix::{bytes_to_nibbles, common_prefix},
     node::{MptNode, LeafNode, Subtree, BranchNode, ExtensionNode}, error::Error,
-    error::Result
+    error::{Result, TrieError}
 };
 
 pub const KEY_LEN: usize = 32;
@@ -23,12 +23,15 @@ pub(crate) fn keccak256(rlp: &[u8]) -> KecHash {
     hasher.finalize().into()
 }
 
-pub trait Database {
+pub trait Database 
+where
+    Self: Sized
+{
     fn new() -> Self;
     /// insert a value
-    fn insert(&mut self, key: &KecHash, value: Vec<u8>);
-    fn exists(&mut self, key: &KecHash) -> bool;
-    fn get(&self, key: &KecHash) -> Option<Vec<u8>>;
+    fn insert(&mut self, key: &KecHash, value: Vec<u8>) -> Result<()>;
+    fn exists(&mut self, key: &KecHash) -> Result<bool>;
+    fn get(&self, key: &KecHash) -> Result<Option<Vec<u8>>>;
 }
 
 #[derive(Clone)]
@@ -59,10 +62,10 @@ where
     K: Serialize,
     V: Serialize + DeserializeOwned
 {
-    pub fn new() -> Self {
+    pub fn new(db: Db) -> Self {
         Self {
             root: None,
-            db: Db::new(),
+            db,
             dirty: false,
             root_hash: None,
             _k: PhantomData::default(),
@@ -71,8 +74,8 @@ where
     }
 
     pub fn revert(mut self, root_hash: KecHash) -> Result<Self> {
-        if let Some(rlp) = self.db.get(&root_hash) {
-            self.root = Some(MptNode::from_rlp(&rlp));
+        if let Some(rlp) = self.db.get(&root_hash)? {
+            self.root = Some(MptNode::from_rlp(&rlp)?);
             self.dirty = false;
             Ok(self)
         } else {
@@ -80,14 +83,14 @@ where
         }
     }
 
-    pub fn insert(mut self, key: &K, value: &V) -> Self {
-        let ivalue = to_bytes(value).unwrap();
-        let rlp_key = to_bytes(key).unwrap();
+    pub fn insert(mut self, key: &K, value: &V) -> Result<Self> {
+        let ivalue = to_bytes(value)?;
+        let rlp_key = to_bytes(key)?;
         let ikey = bytes_to_nibbles(&rlp_key);
 
         let root = mem::replace(&mut self.root, None);
         self.root = Some(match root {
-            Some(root) => node_insert(root, &mut self.db, &ikey, ivalue),
+            Some(root) => node_insert(root, &mut self.db, &ikey, ivalue)?,
             None => LeafNode {
                     remained: ikey,
                     value: ivalue
@@ -96,44 +99,47 @@ where
         // inserted value, not the trie is dirty 
         self.dirty = true;
 
-        self
+        Ok(self)
     }
 
-    pub fn get(&self, key: &K) -> Option<V> {
-        let rlp_key = to_bytes(key).unwrap();
+    pub fn get(&self, key: &K) -> Result<Option<V>> {
+        let rlp_key = to_bytes(key)?;
         let ikey = bytes_to_nibbles(&rlp_key);
 
-        if let Some(root) = &self.root {
-            if let Some(value) = node_get(root, &self.db, &ikey) {
-                Some(from_bytes(&value).unwrap())
+        Ok(if let Some(root) = &self.root {
+            if let Some(value) = node_get(root, &self.db, &ikey)? {
+                Some(from_bytes(&value)?)
             } else {
                 None
             }
         } else {
             None
-        }
+        })
     }
 
     pub fn root_hash(&self) -> Option<KecHash> {
         self.root_hash
     }
 
-    pub fn commit(&mut self) -> Option<KecHash> {
+    pub fn commit(&mut self) -> Result<Option<KecHash>> {
         if !self.dirty {
-            return self.root_hash
+            return Ok(self.root_hash)
         }
 
         let root = mem::replace(&mut self.root, None);
         self.root = if let Some(root) = root {
-            match node_collapse(root, &mut self.db) {
+            match node_collapse(root, &mut self.db)? {
                 Subtree::Node(node) => {
-                    let (dbkey, rlp) = node.encode();
-                    self.db.insert(&dbkey, rlp);
+                    let (dbkey, rlp) = node.encode()?;
+                    self.db.insert(&dbkey, rlp)?;
                     self.root_hash = Some(dbkey);
                     Some(*node)
                 },
                 Subtree::NodeKey(dbkey) => {
-                    let node = MptNode::from_rlp(&self.db.get(&dbkey).unwrap());
+                    let node = MptNode::from_rlp(
+                        &self.db.get(&dbkey)?
+                            .ok_or(Error::TrieError(TrieError::SubtreeNotFound))?
+                    )?;
                     self.root_hash = Some(dbkey);
                     Some(node)
                 },
@@ -145,41 +151,40 @@ where
         };
 
         self.dirty = false;
-        self.root_hash
+        Ok(self.root_hash)
     }
 
-    pub fn prove<ProofDb: Database>(&mut self, key: &K) -> (ProofDb, bool) {
+    pub fn get_proof<ProofDb: Database>(&mut self, key: &K) -> Result<(ProofDb, bool)> {
         if self.dirty {
-            self.commit();
+            self.commit()?;
         }
 
         let mut proof = ProofDb::new();
 
-        let rlp_key = to_bytes(key).unwrap();
+        let rlp_key = to_bytes(key)?;
         let ikey = bytes_to_nibbles(&rlp_key);
 
         let exists = if let Some(root) = &self.root {
-            
-            node_prove(root, &self.db, &mut proof, &ikey)
+            node_proof(root, &self.db, &mut proof, &ikey)?
         } else {
             false
         };
 
-        (proof, exists)
+        Ok((proof, exists))
     }
 }
 
 /// collapse a node
 /// returns (collapsed node, collapsed node length)
-fn node_collapse<Db>(root: MptNode, db: &mut Db) -> Subtree
+fn node_collapse<Db>(root: MptNode, db: &mut Db) -> Result<Subtree>
 where
     Db: Database
 {
-    let rlp = to_bytes(&root).unwrap();
+    let rlp = to_bytes(&root)?;
 
     // this node do not need to be collapsed
     if rlp.len() < 32 {
-        return Subtree::Node(Box::new(root))
+        return Ok(Subtree::Node(Box::new(root)))
     }
 
     let node_collapsed = match root {
@@ -187,7 +192,7 @@ where
         MptNode::Branch(BranchNode { branchs, value }) => {
             let mut collapsed_node = BranchNode::new();
             for (idx, branch) in branchs.into_iter().enumerate() {
-                collapsed_node.branch(idx, subtree_collapse(branch, db));
+                collapsed_node.branch(idx, subtree_collapse(branch, db)?);
             }
             collapsed_node.value = value;
             collapsed_node.into()
@@ -195,98 +200,103 @@ where
         MptNode::Extension(ExtensionNode { shared, subtree }) => {
             ExtensionNode {
                 shared: shared,
-                subtree: subtree_collapse(subtree, db)
+                subtree: subtree_collapse(subtree, db)?
             }.into()
         }
     };
 
-    let (dbkey, rlp) = node_collapsed.encode();
+    let (dbkey, rlp) = node_collapsed.encode()?;
     // after collapsing, a node either keeps unchanged, or part of it is committed to database,
     // in the later case, the node must contains a database key, whose length is 32
     // so the rlp length of collapsed node must exceeds the 32 byte limit
     assert!(rlp.len() >= 32);
-    db.insert(&dbkey, rlp);
-    Subtree::NodeKey(dbkey)
+    db.insert(&dbkey, rlp)?;
+    Ok(Subtree::NodeKey(dbkey))
 }
 
-fn subtree_collapse<Db>(subtree: Subtree, db: &mut Db) -> Subtree
+fn subtree_collapse<Db>(subtree: Subtree, db: &mut Db) -> Result<Subtree>
 where 
     Db: Database
 {
     match subtree {
         Subtree::Node(root) => node_collapse(*root, db),
-        _ => subtree
+        _ => Ok(subtree)
     }
 }
 
-fn node_prove<Db, ProofDb>(root: &MptNode, db: &Db, proof: &mut ProofDb, ikey: &[u8]) -> bool
+fn node_proof<Db, ProofDb>(
+    root: &MptNode, db: &Db, proof: &mut ProofDb, ikey: &[u8]
+) -> Result<bool>
 where
     Db: Database,
     ProofDb: Database
 {
-    let (hash, rlp) = root.encode();
-    proof.insert(&hash, rlp);
+    let (hash, rlp) = root.encode()?;
+    proof.insert(&hash, rlp)?;
     match root {
-        MptNode::Leaf(leaf) => leaf.remained == ikey,
+        MptNode::Leaf(leaf) => Ok(leaf.remained == ikey),
         MptNode::Extension(ExtensionNode { shared, subtree }) => {
             match common_prefix(&shared, ikey) {
                 (_, [], key_remained) => {
-                    subtree_prove(subtree, db, proof, key_remained)
+                    subtree_proof(subtree, db, proof, key_remained)
                 },
-                _ => false
+                _ => Ok(false)
             }
         },
         MptNode::Branch(branch) => {
             if ikey.is_empty() {
-                false
+                Ok(false)
             } else {
                 let (prefix, key_remained) = ikey.split_at(1);
                 let idx = prefix[0] as usize;
                 let subtree = &branch.branchs[idx];
-                subtree_prove(subtree, db, proof, key_remained)
+                subtree_proof(subtree, db, proof, key_remained)
             }
         },
     }
 }
 
-fn subtree_prove<Db, ProofDb>(subtree: &Subtree, db: &Db, proof: &mut ProofDb, ikey: &[u8]) -> bool
+fn subtree_proof<Db, ProofDb>(subtree: &Subtree, db: &Db, proof: &mut ProofDb, ikey: &[u8]) -> Result<bool>
 where
     Db: Database,
     ProofDb: Database
 {
     match subtree {
-        Subtree::Empty => false,
-        Subtree::Node(node) => node_prove(node, db, proof, ikey),
+        Subtree::Empty => Ok(false),
+        Subtree::Node(node) => node_proof(node, db, proof, ikey),
         Subtree::NodeKey(dbkey) => {
-            let rlp = db.get(&dbkey).unwrap();
-            let root = MptNode::from_rlp(&rlp);
-            node_prove(&root, db, proof, ikey)
+            let rlp = db.get(&dbkey)?
+                .ok_or(Error::TrieError(TrieError::SubtreeNotFound))?;
+            let root = MptNode::from_rlp(&rlp)?;
+            node_proof(&root, db, proof, ikey)
         }
     }
 }
 
 /// get value with a key from the trie
-pub(crate) fn node_get<Db>(root: &MptNode, db: &Db, ikey: &[u8]) -> Option<Vec<u8>>
+pub(crate) fn node_get<Db>(
+    root: &MptNode, db: &Db, ikey: &[u8]
+) -> Result<Option<Vec<u8>>>
 where
     Db: Database
 {
     match root {
         MptNode::Leaf(LeafNode { remained, value: leaf_value }) => {
             if remained != ikey {
-                None
+                Ok(None)
             } else {
-                Some(leaf_value.clone())
+                Ok(Some(leaf_value.clone()))
             }
         },
         MptNode::Extension(ExtensionNode { shared, subtree }) => {
             match common_prefix(&shared, ikey) {
                 (_, [], key_remained) => subtree_get(subtree, db, key_remained),
-                _ => None
+                _ => Ok(None)
             }
         },
         MptNode::Branch(BranchNode { branchs, value }) => {
             if ikey.is_empty() {
-                Some(value.clone())
+                Ok(Some(value.clone()))
             } else {
                 let (prefix, key_remained) = ikey.split_at(1);
                 let idx = prefix[0] as usize;
@@ -297,16 +307,19 @@ where
     }
 }
 
-fn subtree_get<Db>(subtree: &Subtree, db: &Db, key: &[u8]) -> Option<Vec<u8>> 
+fn subtree_get<Db>(
+    subtree: &Subtree, db: &Db, key: &[u8]
+) -> Result<Option<Vec<u8>>>
 where
     Db: Database
 {
     match subtree {
-        Subtree::Empty => None,
+        Subtree::Empty => Ok(None),
         Subtree::Node(node) => node_get(node, db, key),
         Subtree::NodeKey(dbkey) => {
-            let rlp = db.get(&dbkey).unwrap();
-            let root = MptNode::from_rlp(&rlp);
+            let rlp = db.get(&dbkey)?
+                .ok_or(Error::TrieError(TrieError::SubtreeNotFound))?;
+            let root = MptNode::from_rlp(&rlp)?;
             node_get(&root, db, key)
         }
     }
@@ -314,11 +327,13 @@ where
 
 /// insert a key-value pair into trie.
 /// Value is a owned Vec<u8> here intentionally to reduce heap allocation.
-fn node_insert<Db>(root: MptNode, db: &mut Db, ikey: &[u8], ivalue: Vec<u8>) -> MptNode
+fn node_insert<Db>(
+    root: MptNode, db: &mut Db, ikey: &[u8], ivalue: Vec<u8>
+) -> Result<MptNode>
 where
     Db: Database
 {
-    match root {
+    Ok(match root {
         // branch node, we choose the corresponding branch and visit it
         MptNode::Branch(BranchNode { mut branchs, value }) => {
             // we finally hit this branch
@@ -334,7 +349,7 @@ where
                 let subtree = Subtree::Empty;
                 // swap out the original subtree
                 let subtree = mem::replace(&mut branchs[idx], subtree);
-                branchs[idx] = subtree_insert(subtree, db, key, ivalue);
+                branchs[idx] = subtree_insert(subtree, db, key, ivalue)?;
                 BranchNode { branchs, value }
             }.into()
         },
@@ -351,8 +366,8 @@ where
                 // not fully matched 
                 (shared, key_remained, leaf_remained) => {
                     let branch = BranchNode::new().into();
-                    let branch = node_insert(branch, db, key_remained, ivalue);
-                    let branch = node_insert(branch, db, leaf_remained, leaf_value);
+                    let branch = node_insert(branch, db, key_remained, ivalue)?;
+                    let branch = node_insert(branch, db, leaf_remained, leaf_value)?;
 
                     // has no common prefix
                     if shared.is_empty() {
@@ -374,7 +389,7 @@ where
                 (_, key_remained, []) => {
                     ExtensionNode {
                         shared,
-                        subtree: subtree_insert(subtree, db, key_remained, ivalue)
+                        subtree: subtree_insert(subtree, db, key_remained, ivalue)?
                     }.into()
                 },
                 // here shared is not empty, so we build a extension first
@@ -393,7 +408,9 @@ where
                         }).into());
                     }
                     
-                    let node = node_insert(branch.into(), db, key_remained, ivalue);
+                    let node = node_insert(
+                        branch.into(), db, key_remained, ivalue
+                    )?;
                     if shared.is_empty() {
                         node
                     } else {
@@ -405,14 +422,16 @@ where
                 }
             }
         }
-    }
+    })
 }
 
-fn subtree_insert<Db>(subtree: Subtree, db: &mut Db, key: &[u8], value: Vec<u8>) -> Subtree
+fn subtree_insert<Db>(
+    subtree: Subtree, db: &mut Db, key: &[u8], value: Vec<u8>
+) -> Result<Subtree>
 where 
     Db: Database
 {
-    Subtree::Node(Box::new(match subtree {
+    Ok(Subtree::Node(Box::new(match subtree {
         // subtress is empty, we 
         Subtree::Empty => {
             LeafNode {
@@ -421,12 +440,13 @@ where
             }.into()
         },
         Subtree::Node(root) => {
-            node_insert(*root, db, key, value)
+            node_insert(*root, db, key, value)?
         },
         Subtree::NodeKey(dbkey) => {
-            let rlp = db.get(&dbkey).unwrap();
-            let root = MptNode::from_rlp(&rlp);
-            node_insert(root, db, key, value)
+            let rlp = db.get(&dbkey)?
+                .ok_or(Error::TrieError(TrieError::SubtreeNotFound))?;
+            let root = MptNode::from_rlp(&rlp)?;
+            node_insert(root, db, key, value)?
         }
-    }))
+    })))
 }

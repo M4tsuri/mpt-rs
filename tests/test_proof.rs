@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 
-use mpt_rs::{mpt::{Trie, Database, KecHash}, proof::verify_prove};
+use mpt_rs::{mpt::{Trie, Database, KecHash}, proof::verify_proof};
 use serde::{Deserialize, Serialize};
 use num_bigint::BigUint;
 use serde_bytes;
 use serlp::types::{biguint, byte_array};
 use hex;
+use mpt_rs::error::Result;
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 struct LegacyTx {
@@ -86,15 +87,15 @@ fn test_tx() {
     };
 
     let txs = [tx0, tx1, tx2, tx3];
-    let mut trie: Trie<MapDb, _, _> = Trie::new();
+    let mut trie: Trie<MapDb, _, _> = Trie::new(MapDb::new());
 
     for (i, tx) in txs.iter().enumerate() {
-        trie = trie.insert(&i, tx);
+        trie = trie.insert(&i, tx).unwrap();
     }
     
     assert_eq!(
         "ab41f886be23cd786d8a69a72b0f988ea72e0b2e03970d0798f5e03763a442cc",
-        hex::encode(trie.commit().unwrap())
+        hex::encode(trie.commit().unwrap().unwrap())
     )
 }
 
@@ -105,22 +106,22 @@ fn test_revert() {
     let c = "c".to_string().repeat(35);
     let d = "d".to_string().repeat(400);
 
-    let mut trie: Trie<MapDb, _, _> = Trie::new();
+    let mut trie: Trie<MapDb, _, _> = Trie::new(MapDb::new());
 
-    trie = trie.insert(&"aaaa", &a);
-    trie = trie.insert(&"aaaab", &b);
-    let root_hash = trie.commit().unwrap();
-    trie = trie.insert(&"aaaa", &c);
-    trie = trie.insert(&"aa", &d);
+    trie = trie.insert(&"aaaa", &a).unwrap();
+    trie = trie.insert(&"aaaab", &b).unwrap();
+    let root_hash = trie.commit().unwrap().unwrap();
+    trie = trie.insert(&"aaaa", &c).unwrap();
+    trie = trie.insert(&"aa", &d).unwrap();
 
-    assert_eq!(b, trie.get(&"aaaab").unwrap());
-    assert_eq!(None, trie.get(&"a"));
-    assert_eq!(c, trie.get(&"aaaa").unwrap());
-    assert_eq!(d, trie.get(&"aa").unwrap());
+    assert_eq!(b, trie.get(&"aaaab").unwrap().unwrap());
+    assert_eq!(None, trie.get(&"a").unwrap());
+    assert_eq!(c, trie.get(&"aaaa").unwrap().unwrap());
+    assert_eq!(d, trie.get(&"aa").unwrap().unwrap());
 
     // revert the state
     trie = trie.revert(root_hash).unwrap();
-    assert_eq!(a, trie.get(&"aaaa").unwrap());
+    assert_eq!(a, trie.get(&"aaaa").unwrap().unwrap());
 }
 
 #[test]
@@ -130,29 +131,29 @@ fn test_proof() {
     let c = "c".to_string().repeat(35);
     let d = "d".to_string().repeat(400);
 
-    let mut trie: Trie<MapDb, _, _> = Trie::new();
+    let mut trie: Trie<MapDb, _, _> = Trie::new(MapDb::new());
 
-    trie = trie.insert(&"aaaa", &a);
-    trie = trie.insert(&"aaaab", &b);
-    let old_root_hash = trie.commit().unwrap();
-    trie = trie.insert(&"aaaa", &c);
-    trie = trie.insert(&"aa", &d);
-    let new_root_hash = trie.commit().unwrap();
+    trie = trie.insert(&"aaaa", &a).unwrap();
+    trie = trie.insert(&"aaaab", &b).unwrap();
+    let old_root_hash = trie.commit().unwrap().unwrap();
+    trie = trie.insert(&"aaaa", &c).unwrap();
+    trie = trie.insert(&"aa", &d).unwrap();
+    let new_root_hash = trie.commit().unwrap().unwrap();
 
     // proof of existence 
-    let (proof, exists) = trie.prove::<MapDb>(&"aaaa");
+    let (proof, exists) = trie.get_proof::<MapDb>(&"aaaa").unwrap();
     assert_eq!(exists, true);
     // verify with old hash, this should fail
-    assert!(!verify_prove(&old_root_hash, &proof, &"aaaa"));
+    assert!(!verify_proof(&old_root_hash, &proof, &"aaaa").unwrap());
     // verify with the newest hash, should success
-    assert!(verify_prove(&new_root_hash, &proof, &"aaaa"));
+    assert!(verify_proof(&new_root_hash, &proof, &"aaaa").unwrap());
 
     // proof of non-existence
-    let (proof, exists) = trie.prove::<MapDb>(&"a");
+    let (proof, exists) = trie.get_proof::<MapDb>(&"a").unwrap();
     assert_eq!(exists, false);
     // both should fail
-    assert!(!verify_prove(&old_root_hash, &proof, &"a"));
-    assert!(!verify_prove(&new_root_hash, &proof, &"a"));
+    assert!(!verify_proof(&old_root_hash, &proof, &"a").unwrap());
+    assert!(!verify_proof(&new_root_hash, &proof, &"a").unwrap());
 }
 
 #[derive(Debug, Clone)]
@@ -163,15 +164,16 @@ impl Database for MapDb {
         Self(HashMap::new())
     }
 
-    fn insert(&mut self, key: &KecHash, value: Vec<u8>) {
+    fn insert(&mut self, key: &KecHash, value: Vec<u8>) -> Result<()> {
         self.0.insert(*key, value);
+        Ok(())
     }
 
-    fn exists(&mut self, key: &KecHash) -> bool {
-        self.0.contains_key(key)
+    fn exists(&mut self, key: &KecHash) -> Result<bool> {
+        Ok(self.0.contains_key(key))
     }
 
-    fn get(&self, key: &KecHash) -> Option<Vec<u8>> {
-        self.0.get(key).cloned()
+    fn get(&self, key: &KecHash) -> Result<Option<Vec<u8>>> {
+        Ok(self.0.get(key).cloned())
     }
 }

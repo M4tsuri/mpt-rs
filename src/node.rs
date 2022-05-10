@@ -19,12 +19,12 @@ use serlp::{
     de::RlpProxy,
     types::byte_array
 };
-use array_init::array_init;
+use array_init::{try_array_init, array_init} ;
 
 use crate::{hex_prefix::{
     Nibbles,
     FLAG_MASK
-}, mpt::{KecHash, keccak256, KEY_LEN}};
+}, mpt::{KecHash, keccak256, KEY_LEN}, error::{Error, Result}};
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub(crate) struct LeafNode {
@@ -61,7 +61,7 @@ mod hex_prefix_leaf {
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-#[serde(from = "RlpProxy")]
+#[serde(try_from = "RlpProxy")]
 pub(crate) enum Subtree {
     /// this field will be encoded into 0x80 with RLP encoding
     Empty,
@@ -76,22 +76,24 @@ impl From<MptNode> for Subtree {
     }
 }
 
-impl From<RlpProxy> for Subtree {
-    fn from(node: RlpProxy) -> Self {
+impl TryFrom<RlpProxy> for Subtree {
+    type Error = Error;
+
+    fn try_from(node: RlpProxy) -> std::result::Result<Self, Self::Error> {
         let buf = node.raw();
         
-        match buf.len() {
+        Ok(match buf.len() {
             // empty 
             1 if buf[0] == 0x80 => Subtree::Empty,
-            1..=31 => Subtree::Node(Box::new(from_bytes(&buf).unwrap())),
+            1..=31 => Subtree::Node(Box::new(from_bytes(&buf)?)),
             32.. => {
-                let key_buf: ByteBuf = from_bytes(buf).unwrap();
+                let key_buf: ByteBuf = from_bytes(buf)?;
                 let mut key = [0; KEY_LEN];
                 key.copy_from_slice(&key_buf);
                 Subtree::NodeKey(key)
             },
             _ => panic!("Error subtree encoding.")
-        }
+        })
     }
 }
 
@@ -129,7 +131,7 @@ mod hex_prefix_extension {
 }
 
 #[derive(Deserialize, Clone, PartialEq, Eq, Debug)]
-#[serde(from = "RlpProxy")]
+#[serde(try_from = "RlpProxy")]
 pub(crate) struct BranchNode {
     pub branchs: [Subtree; 16],
     /// vec is empty when this node is not leaf
@@ -137,19 +139,29 @@ pub(crate) struct BranchNode {
     pub value: Vec<u8>
 }
 
-impl From<RlpProxy> for BranchNode {
-    fn from(proxy: RlpProxy) -> Self {
+impl TryFrom<RlpProxy> for BranchNode {
+    type Error = Error;
+
+    fn try_from(proxy: RlpProxy) -> std::result::Result<Self, Error> {
         let mut tree = proxy.rlp_tree();
         let root = tree.root_mut();
         if let RlpNodeValue::Compound(compound) = &mut root.value {
-            let branchs: [Subtree; 16] = array_init(|_| {
-                from_bytes::<Subtree>(compound.pop_front().unwrap().span).unwrap()
-            });
-            let value: ByteBuf = from_bytes(compound.pop_front().unwrap().span).unwrap();
-            Self {
+            let branchs = try_array_init::<Error, _, _, 16>(|_| {
+                Ok(from_bytes::<Subtree>(compound.pop_front()
+                    .ok_or(
+                        Error::EncodingError("Error decoding branchs".into())
+                    )?.span
+                )?)
+            })?;
+            let value: ByteBuf = from_bytes(compound.pop_front()
+                .ok_or(
+                    Error::EncodingError("Error decoding branchs".into())
+                )?.span
+            )?;
+            Ok(Self {
                 branchs,
                 value: value.into_vec()
-            }
+            })
         } else {
             panic!("Malformed Branch Node.")
         }
@@ -157,7 +169,7 @@ impl From<RlpProxy> for BranchNode {
 }
 
 impl Serialize for BranchNode {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: Serializer 
     {
@@ -184,7 +196,7 @@ impl BranchNode {
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-#[serde(from = "RlpProxy")]
+#[serde(try_from = "RlpProxy")]
 pub(crate) enum MptNode {
     Leaf(LeafNode),
     Extension(ExtensionNode),
@@ -192,39 +204,42 @@ pub(crate) enum MptNode {
 }
 
 impl MptNode {
-    pub fn encode(&self) -> (KecHash, Vec<u8>) {
-        let encoded = to_bytes(self).unwrap();
-        (keccak256(&encoded), encoded)
+    pub fn encode(&self) -> Result<(KecHash, Vec<u8>)> {
+        let encoded = to_bytes(self)?;
+        Ok((keccak256(&encoded), encoded))
     }
 
-    pub fn from_rlp(rlp: &[u8]) -> Self {
-        from_bytes(rlp).unwrap()
+    pub fn from_rlp(rlp: &[u8]) -> Result<Self> {
+        Ok(from_bytes(rlp)?)
     }
 }
 
-impl From<RlpProxy> for MptNode {
-    fn from(proxy: RlpProxy) -> Self {
+impl TryFrom<RlpProxy> for MptNode {
+    type Error = Error;
+
+    fn try_from(proxy: RlpProxy) ->  std::result::Result<Self, Error> {
         let mut tree = proxy.rlp_tree();
         let root = tree.root();
         let buf = proxy.raw();
 
-        if let RlpNodeValue::Compound(nodes) = &root.value {
+        Ok(if let RlpNodeValue::Compound(nodes) = &root.value {
             match nodes.len() {
                 2 => {
-                    let nibbles = tree.next().unwrap();
+                    let nibbles = tree.next()
+                        .ok_or(Error::EncodingError("Error Decoding Node.".into()))?;
                     let flag = nibbles[0] & FLAG_MASK;
                     if flag == 0 {
-                        MptNode::Extension(from_bytes(buf).unwrap())
+                        MptNode::Extension(from_bytes(buf)?)
                     } else {
-                        MptNode::Leaf(from_bytes(buf).unwrap())
+                        MptNode::Leaf(from_bytes(buf)?)
                     }
                 },
-                17 => MptNode::Branch(from_bytes(buf).unwrap()),
+                17 => MptNode::Branch(from_bytes(buf)?),
                 _ => panic!("Unexpected node type.")
             }
         } else {
             panic!("Unexpected node type.")
-        }
+        })
     }
 }
 
@@ -266,7 +281,7 @@ mod test_nodes {
         let node = MptNode::Extension(extension.clone());
 
         // RLP encode
-        let (hash, encoded) = node.encode();
+        let (hash, encoded) = node.encode().unwrap();
         let expected = hex::decode("e4850001020304ddc882350684636f696e8080808080808080808080808080808476657262").unwrap();
         assert_eq!(encoded, expected);
         assert_eq!(hex::encode(hash), "64d67c5318a714d08de6958c0e63a05522642f3f1087c6fd68a97837f203d359");
@@ -277,7 +292,7 @@ mod test_nodes {
         assert_eq!(expected_tree, real_tree);
 
         // RLP decode
-        let decoded = MptNode::from_rlp(&encoded);
+        let decoded = MptNode::from_rlp(&encoded).unwrap();
         assert_eq!(decoded, node);
     }
 }
