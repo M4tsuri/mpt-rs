@@ -1,6 +1,6 @@
 ## Merkle Patricia Tree的Rust实现
 
-**博客文章：https://dere.press/2022/01/24/eth-trie/**
+**博客文章：https://m4tsuri.io/2022/01/24/eth-trie/**
 
 本实现参考下列项目：
 
